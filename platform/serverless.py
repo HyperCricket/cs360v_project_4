@@ -232,6 +232,24 @@ class Platform:
              self.FAIL_THRESHOLD.
 
         Change b["up"], b["fails"] and b["funcs"] while holding self.lock."""
+        try: 
+            if runner_call(b["host"], b["port"], "PING", 1.5) == "PONG":
+                funcs = runner_call(b["host"], b["port"], "FUNCS", 1.5)
+                with self.lock:
+                    funcs = funcs.split(" ")
+                    b["funcs"] = funcs[1:]
+                    b["fails"] = 0
+                    b["up"] = True
+            else:
+                with self.lock:
+                    b["fails"] += 1
+                    if b["fails"] == self.FAIL_THRESHOLD:
+                        b["up"] = False
+        except OSError:
+            with self.lock:
+                b["fails"] += 1
+                if b["fails"] == self.FAIL_THRESHOLD:
+                    b["up"] = False
         pass
 
     def backends_status(self):
@@ -240,7 +258,18 @@ class Platform:
         "outstanding", "invocations", "errors", and "avg_latency_ms"
         (latency_sum / invocations, in milliseconds; 0 if there are no
         invocations). Hold self.lock."""
-        return []
+        res = []
+        with self.lock:
+            for b in self.backends:
+                avg = (b["latency_sum"] / b["invocations"] * 1000) if b["invocations"] else 0
+                res.append({"backend": f"{b["host"]}:{b["port"]}",
+                            "up": b["up"],
+                            "outstanding": b["outstanding"],
+                            "invocations": b["invocations"],
+                            "errors": b["errors"],
+                            "funcs": sorted(b["funcs"]),
+                            "avg_latency_ms": avg})
+        return res
 
     def _note_failure(self, b):
         """PROVIDED: call this when a request to `b` fails. No more requests go
