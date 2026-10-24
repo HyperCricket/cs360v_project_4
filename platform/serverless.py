@@ -299,12 +299,66 @@ class Platform:
 
         Do not call lookup() or anything else that takes self.lock in here: you
         already hold it, and taking it a second time hangs forever."""
-        return None
+        
+        chosen_backend = None
+
+        with self.slot_free:
+            all_max_outstanding = True
+            
+            usable_backend = []
+            for b in self.backends:
+                if b["up"] and function in b["funcs"]:
+                    usable_backend.append(b)
+                    if b["outstanding"] < self.MAX_OUTSTANDING:
+                        all_max_outstanding = False
+            
+            if len(usable_backend) == 0:
+                return None
+
+            while (all_max_outstanding):
+                if (deadline <= time.monotonic()):
+                    return "timeout"
+                self.slot_free.wait()
+                for b in self.backends:
+                    if b["up"] and function in b["funcs"]:
+                        usable_backend.append(b)
+                        if b["outstanding"] < self.MAX_OUTSTANDING:
+                            all_max_outstanding = False
+                
+                if len(usable_backend) == 0:
+                    return None
+            
+            lowest_outstanding = []
+            lowest_outstanding_num = None
+            for u_b in usable_backend:
+                if lowest_outstanding_num is None or lowest_outstanding_num > u_b["outstanding"]:
+                    lowest_outstanding_num = u_b["outstanding"]
+                    lowest_outstanding = []
+                if lowest_outstanding_num == u_b["outstanding"]:
+                    lowest_outstanding.append(u_b)
+
+            if len(lowest_outstanding) > 1:
+                lowest_invocations = []
+                lowest_invocations_num = None
+                for u_o in lowest_outstanding:
+                    if lowest_invocations_num is None or lowest_invocations_num > u_b["invocation"]:
+                        lowest_invocations_num = u_o["invocation"]
+                        lowest_invocations = []
+                    if lowest_invocations_num == u_b["invocation"]:
+                        lowest_invocations.append(u_b)
+                chosen_backend = lowest_invocations[0]
+            else:
+                chosen_backend = lowest_outstanding[0]
+            chosen_backend["invocations"] += 1
+        return chosen_backend
 
     def _release(self, b):
         """TODO(student) Part III: give back the slot _acquire took. Inside
         `with self.slot_free:`, subtract 1 from b["outstanding"] and wake one
         waiting request with self.slot_free.notify()."""
+        with self.slot_free:
+            b["outstanding"] -= 1
+            self.slot_free.notify()
         pass
 
     # ---- autoscaling --------------------------------------------------
@@ -445,6 +499,22 @@ class Platform:
 
         Catch socket.timeout before OSError: socket.timeout is a kind of
         OSError. Hold self.lock whenever you change a counter."""
+        with self.lock:
+            if not name in self.registry:
+                return 404, {"error": f"{name} not deployed"}
+            self.metrics_data["invocations"] += 1
+            # self.metrics_data["by_function"]
+            deadline = time.monotonic() + self.invoke_timeout
+            usable_backend = _acquire(self, name["function"], deadline)
+            if usable_backend is None:
+                self.metrics_data["no_backend"] += 1
+                return 503, {"error", f"{name} has no backend"}
+            if usable_backend == "timeout":
+                self.metrics_data["rejected"] += 1
+                return 503, {"error", f"{name} timed out"}
+            runner_call(usable_backend["host"], usable_backend["port"], f"RUN {name["function"]} {payload}", max(0.05, deadline - time.monotonic()))
+            _release(usable_backend)
+
         return 500, {"error": "invoke not implemented"}
 
     # ---- metrics: what you implement ----------------------------------
