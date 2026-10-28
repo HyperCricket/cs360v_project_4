@@ -191,6 +191,8 @@ class Platform:
         Hold self.lock while you use self.registry."""
         if not name:
             return 400, {"error": "name is empty"}
+        if not function:
+            function = name
         with self.lock:
             if name in self.registry:
                 return 409, {"error": f"{name} is already registered"}
@@ -299,59 +301,35 @@ class Platform:
 
         Do not call lookup() or anything else that takes self.lock in here: you
         already hold it, and taking it a second time hangs forever."""
-        
-        chosen_backend = None
-
         with self.slot_free:
-            all_max_outstanding = True
-            
-            usable_backend = []
-            for b in self.backends:
-                if b["up"] and function in b["funcs"]:
-                    usable_backend.append(b)
-                    if b["outstanding"] < self.MAX_OUTSTANDING:
-                        all_max_outstanding = False
-            
-            if len(usable_backend) == 0:
-                return None
-
-            while (all_max_outstanding):
-                if (deadline <= time.monotonic()):
-                    return "timeout"
-                self.slot_free.wait(timeout=deadline - time.monotonic())
-                usable_backend = []
+            while True:
+                has_function = False
+                best = None
                 for b in self.backends:
-                    if b["up"] and function in b["funcs"]:
-                        usable_backend.append(b)
-                        if b["outstanding"] < self.MAX_OUTSTANDING:
-                            all_max_outstanding = False
-                
-                if len(usable_backend) == 0:
-                    return None
-            
-            lowest_outstanding = []
-            lowest_outstanding_num = None
-            for u_b in usable_backend:
-                if lowest_outstanding_num is None or lowest_outstanding_num > u_b["outstanding"]:
-                    lowest_outstanding_num = u_b["outstanding"]
-                    lowest_outstanding = []
-                if lowest_outstanding_num == u_b["outstanding"]:
-                    lowest_outstanding.append(u_b)
+                    if not b["up"] or function not in b["funcs"]:
+                        continue
+                    has_function = True
+                    if b["outstanding"] >= self.MAX_OUTSTANDING:
+                        continue
+                    if best is None:
+                        best = b
+                    elif b["outstanding"] < best["outstanding"]:
+                        best = b
+                    elif (b["outstanding"] == best["outstanding"] and b["invocations"] < best["invocations"]):
+                        best = b
 
-            if len(lowest_outstanding) > 1:
-                lowest_invocations = []
-                lowest_invocations_num = None
-                for u_o in lowest_outstanding:
-                    if lowest_invocations_num is None or lowest_invocations_num > u_b["invocation"]:
-                        lowest_invocations_num = u_o["invocation"]
-                        lowest_invocations = []
-                    if lowest_invocations_num == u_b["invocation"]:
-                        lowest_invocations.append(u_b)
-                chosen_backend = lowest_invocations[0]
-            else:
-                chosen_backend = lowest_outstanding[0]
-            chosen_backend["invocations"] += 1
-        return chosen_backend
+                if best is not None:
+                    best["outstanding"] += 1
+                    return best
+                if not has_function:
+                    return None
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "timeout"
+                self.slot_free.wait(timeout = remaining)
+
+
 
     def _release(self, b):
         """TODO(student) Part III: give back the slot _acquire took. Inside
@@ -502,50 +480,61 @@ class Platform:
         OSError. Hold self.lock whenever you change a counter."""
         entry = self.lookup(name)
         if entry is None:
-            return 404
+            return 404, {"error": f"{name} is not registered"}
+        function = entry["function"]
+
         with self.lock:
             self.metrics_data["invocations"] += 1
-            self.metrics_data["by_functions"][name] += 1
+            by_fn = self.metrics_data["by_function"]
+            by_fn[name] = by_fn.get(name, 0) + 1
 
-        # self.metrics_data["by_function"]
         deadline = time.monotonic() + self.invoke_timeout
-        while deadline > time.monotonic():
-            usable_backend = self._acquire(self, name["function"], deadline)
-            if usable_backend is None:
+        while time.monotonic() < deadline:
+            b = self._acquire(function, deadline)
+            if b is None:
                 with self.lock:
                     self.metrics_data["no_backend"] += 1
-                return 503, {"error", f"{name} has no backend"}
-            if usable_backend == "timeout":
+                return 503, {"error": f"no backend can run {function}"}
+            if b == "timeout":
                 with self.lock:
                     self.metrics_data["rejected"] += 1
-                return 503, {"error", f"{name} timed out"}
+                return 503, {"error": "all backends are busy"}
+
+            start = time.monotonic()
             try:
-                funcs = runner_call(usable_backend["host"], usable_backend["port"], f"RUN {name["function"]} {payload}", max(0.05, deadline - time.monotonic()))
+                reply = runner_call(b["host"], b["port"], f"RUN {function} {payload}",
+                                    max(0.05, deadline - time.monotonic()))
             except socket.timeout:
                 with self.lock:
                     self.metrics_data["timeouts"] += 1
-                    usable_backend["errors"] += 1
-                self._note_failure(usable_backend)
-                return 504
+                    b["errors"] += 1
+                self._note_failure(b)
+                return 504, {"error": f"{function} timed out"}
             except OSError:
                 with self.lock:
-                    usable_backend["errors"] += 1
-                self._note_failure(usable_backend)
+                    b["errors"] += 1
+                self._note_failure(b)
                 continue
-            self._release(usable_backend)
-            elapsed_time = time.monotonic() - (deadline - self.invoke_timeout)
-            if funcs.startswith("OK"):
+            finally:
+                self._release(b)      # runs on every path above: return, continue, or fall through
+            elapsed = time.monotonic() - start
+
+            if reply.startswith("OK"):
                 with self.lock:
                     self.metrics_data["successes"] += 1
-                    usable_backend["latency_sum"] += elapsed_time
-                    usable_backend["invocations"] += 1
-                return 200, {f"\"result\": {funcs[:3].strip()}, \"backend\": \"{usable_backend["host"]}:{usable_backend["port"]}\""}
+                    b["latency_sum"] += elapsed
+                    b["invocations"] += 1
+                return 200, {"result": reply[3:].strip(),
+                             "backend": f"{b['host']}:{b['port']}"}
+
             with self.lock:
-                usable_backend["errors"] += 1
-            return 400, {"error", funcs}
+                self.metrics_data["errors"] += 1
+                b["errors"] += 1
+            return 400, {"error": reply}
+
         with self.lock:
             self.metrics_data["errors"] += 1
-        return 502
+        return 502, {"error": "no backend answered before the deadline"}
 
     # ---- metrics: what you implement ----------------------------------
 
