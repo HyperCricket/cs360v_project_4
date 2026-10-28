@@ -318,7 +318,8 @@ class Platform:
             while (all_max_outstanding):
                 if (deadline <= time.monotonic()):
                     return "timeout"
-                self.slot_free.wait()
+                self.slot_free.wait(timeout=deadline - time.monotonic())
+                usable_backend = []
                 for b in self.backends:
                     if b["up"] and function in b["funcs"]:
                         usable_backend.append(b)
@@ -499,23 +500,52 @@ class Platform:
 
         Catch socket.timeout before OSError: socket.timeout is a kind of
         OSError. Hold self.lock whenever you change a counter."""
+        entry = self.lookup(name)
+        if entry is None:
+            return 404
         with self.lock:
-            if not name in self.registry:
-                return 404, {"error": f"{name} not deployed"}
             self.metrics_data["invocations"] += 1
-            # self.metrics_data["by_function"]
-            deadline = time.monotonic() + self.invoke_timeout
-            usable_backend = _acquire(self, name["function"], deadline)
+            self.metrics_data["by_functions"][name] += 1
+
+        # self.metrics_data["by_function"]
+        deadline = time.monotonic() + self.invoke_timeout
+        while deadline > time.monotonic():
+            usable_backend = self._acquire(self, name["function"], deadline)
             if usable_backend is None:
-                self.metrics_data["no_backend"] += 1
+                with self.lock:
+                    self.metrics_data["no_backend"] += 1
                 return 503, {"error", f"{name} has no backend"}
             if usable_backend == "timeout":
-                self.metrics_data["rejected"] += 1
+                with self.lock:
+                    self.metrics_data["rejected"] += 1
                 return 503, {"error", f"{name} timed out"}
-            runner_call(usable_backend["host"], usable_backend["port"], f"RUN {name["function"]} {payload}", max(0.05, deadline - time.monotonic()))
-            _release(usable_backend)
-
-        return 500, {"error": "invoke not implemented"}
+            try:
+                funcs = runner_call(usable_backend["host"], usable_backend["port"], f"RUN {name["function"]} {payload}", max(0.05, deadline - time.monotonic()))
+            except socket.timeout:
+                with self.lock:
+                    self.metrics_data["timeouts"] += 1
+                    usable_backend["errors"] += 1
+                self._note_failure(usable_backend)
+                return 504
+            except OSError:
+                with self.lock:
+                    usable_backend["errors"] += 1
+                self._note_failure(usable_backend)
+                continue
+            self._release(usable_backend)
+            elapsed_time = time.monotonic() - (deadline - self.invoke_timeout)
+            if funcs.startswith("OK"):
+                with self.lock:
+                    self.metrics_data["successes"] += 1
+                    usable_backend["latency_sum"] += elapsed_time
+                    usable_backend["invocations"] += 1
+                return 200, {f"\"result\": {funcs[:3].strip()}, \"backend\": \"{usable_backend["host"]}:{usable_backend["port"]}\""}
+            with self.lock:
+                usable_backend["errors"] += 1
+            return 400, {"error", funcs}
+        with self.lock:
+            self.metrics_data["errors"] += 1
+        return 502
 
     # ---- metrics: what you implement ----------------------------------
 
