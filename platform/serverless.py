@@ -544,7 +544,11 @@ class Platform:
         self.backends_status() (Part II).
         Copy while holding self.lock, but call backends_status() after releasing
         it: it takes the lock itself, and self.lock cannot be taken twice."""
-        return {}
+        with self.lock:
+            metrics_data = self.metrics_data.copy()
+            metrics_data["by_function"] = metrics_data["by_function"].copy()
+        metrics_data["backends"] = self.backends_status()
+        return metrics_data
 
 
 # ======================================================================
